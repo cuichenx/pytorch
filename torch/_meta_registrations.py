@@ -7921,6 +7921,10 @@ def zero_numel_check_dims(self, dim, fn_name):
 
 # From aten/src/ATen/native/ReduceOps.cpp
 def check_argmax_argmin(name, self, dim):
+    torch._check(
+        self.dtype is not torch.bool,
+        lambda: f"{name}(): does not support bool input",
+    )
     if dim is not None:
         dim = maybe_wrap_dim(dim, self.dim())
         zero_numel_check_dims(self, dim, name)

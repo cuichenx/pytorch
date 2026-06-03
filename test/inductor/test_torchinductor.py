@@ -12426,6 +12426,23 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, (torch.randn([144, 144]),))
 
+    def test_argmax_bool_input_raises(self):
+        def fn(scores, values):
+            mask = scores > 0.0
+            idx = torch.argmax(mask, dim=1)
+            return values[idx].sum()
+
+        scores = torch.tensor(
+            [[-1.0, 2.0, -3.0], [4.0, -5.0, 6.0]], dtype=torch.float32
+        )
+        values = torch.tensor([10.0, 20.0, 30.0])
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        with self.assertRaisesRegex(
+            RuntimeError, r"argmax\(\): does not support bool input"
+        ):
+            compiled(scores, values)
+
     def test_argmax_argmin_with_duplicates(self):
         def fn(x):
             return (
