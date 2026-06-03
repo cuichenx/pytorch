@@ -587,6 +587,56 @@ class TestControlDeps(InductorTestCase):
         expected = fn(torch.ones(4, 4, device=GPU_TYPE))
         torch.testing.assert_close(result, expected)
 
+    @requires_gpu()
+    def test_restore_external_objects_before_backward(self):
+        """The forward epilogue snapshots the external object registry into
+        ctx._external_objects, and backward restores it. This protects
+        against a second torch.compile frame's store_user_object_weakrefs
+        clobbering the registry between forward and backward.
+
+        This unit test simulates the clobber and verifies the snapshot/restore
+        mechanism works, without requiring a full multi-frame compilation."""
+        from torch._dynamo.graph_bytecode_inputs import (
+            get_external_object_by_index,
+            index_to_external_object_weakref,
+            set_external_object_by_index,
+            store_user_object_weakrefs,
+        )
+
+        s1 = torch.cuda.Stream()
+        s2 = torch.cuda.Stream()
+        e1 = torch.Event()
+
+        # Simulate fn1's forward: register 3 objects
+        store_user_object_weakrefs(s1, s2, e1)
+        self.assertIs(get_external_object_by_index(0), s1)
+        self.assertIs(get_external_object_by_index(1), s2)
+        self.assertIs(get_external_object_by_index(2), e1)
+
+        # Snapshot (what commit 7 does in forward epilogue)
+        snapshot = {
+            k: ref()
+            for k, ref in index_to_external_object_weakref.items()
+            if ref() is not None
+        }
+
+        # Simulate fn2's forward clobbering with fewer entries
+        s3 = torch.cuda.Stream()
+        store_user_object_weakrefs(s3)
+        self.assertIs(get_external_object_by_index(0), s3)
+        with self.assertRaises(AssertionError):
+            get_external_object_by_index(2)
+
+        # Restore (what commit 7 does before backward)
+        for idx, obj in snapshot.items():
+            if obj is not None:
+                set_external_object_by_index(idx, obj)
+
+        # fn1's backward can now find all its objects
+        self.assertIs(get_external_object_by_index(0), s1)
+        self.assertIs(get_external_object_by_index(1), s2)
+        self.assertIs(get_external_object_by_index(2), e1)
+
 
 if __name__ == "__main__":
     if IS_LINUX and HAS_GPU_AND_TRITON:
