@@ -2086,15 +2086,20 @@ def _sym_register(
 
 def _sym_op_arg_node(tracer: _ProxyTracer, a: object) -> object:
     # Constant sym values carry no proxy slot; fold them to a literal so
-    # untracked constants don't hit "is not tracked with proxy".
+    # untracked constants don't hit "is not tracked with proxy". Gate on the
+    # unreplaced expr: an unbacked symbol with a constant replacement (e.g. u0
+    # after torch._check(u0 == 5)) reports expr.is_number, but it is still
+    # tracked with a proxy and must keep its node, or the deferred runtime
+    # assert collapses to a constant and never fires.
     if not isinstance(a, py_sym_types):
         return a
-    if a.node.expr.is_number:
+    expr = a.node._expr
+    if isinstance(expr, int) or expr.is_number:
         if isinstance(a, SymBool):
-            return bool(a.node.expr)
+            return bool(expr)
         if isinstance(a, SymInt):
-            return int(a.node.expr)
-        return float(a.node.expr)
+            return int(expr)
+        return float(expr)
     return get_proxy_slot(a, tracer).force().node
 
 
