@@ -653,7 +653,6 @@ class TestInductorDynamic(TestCase):
 
         size_hints = {"x": 600_000_000}
         x = 64
-        num_warps = _num_warps(8)
         warp_size = 64 if torch.version.hip else 32
         device_props = DeviceProperties(
             type="hip" if torch.version.hip else "cuda",
@@ -662,6 +661,7 @@ class TestInductorDynamic(TestCase):
             cc="gfx000" if torch.version.hip else 80,
             warp_size=warp_size,
         )
+        num_warps = _num_warps(8, device_props=device_props)
 
         result_x, result_num_blocks = _check_max_grid_x(
             size_hints, x, num_warps, device_props
