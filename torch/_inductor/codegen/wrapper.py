@@ -1263,6 +1263,7 @@ class PythonWrapperCodegen(CodeGen):
 
     def __init__(self):
         super().__init__()
+        self._stream_cache_setup_devices: OrderedSet[int] = OrderedSet()
         self._pending_input_asserts: dict[str, tuple[str, str]] = {}
         self._pending_alignment_copies: OrderedSet[str] = OrderedSet()
         self._names_iter: Iterator[int] = count()

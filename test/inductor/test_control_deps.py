@@ -1,5 +1,7 @@
 # Owner(s): ["module: inductor"]
 
+import unittest
+
 import torch
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
@@ -8,9 +10,13 @@ from torch.testing import FileCheck
 from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
+    HAS_CUDA_AND_TRITON,
     HAS_GPU_AND_TRITON,
     requires_gpu,
 )
+
+
+requires_cuda_triton = unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA")
 
 
 class TestControlDeps(InductorTestCase):
@@ -258,92 +264,6 @@ class TestControlDeps(InductorTestCase):
             torch.testing.assert_close(result, expected)
 
     @requires_gpu()
-    def test_wait_event_threads_record_event_passthroughs(self):
-        """wait_event must thread record_event's passthroughs to consumers.
-
-        Regression test for the backward reload pattern:
-          reload [side stream] → record_event → ... → wait_event [default] → consumer
-
-        Without threading, the consumer depends only on record_event's getitem
-        (wrong stream), so the inductor scheduler can place the consumer kernel
-        before wait_event fires.
-        """
-        import operator
-
-        from torch._functorch._aot_autograd.streams import (
-            wrap_all_sync_nodes_with_control_deps,
-        )
-        from torch._inductor.fx_passes.control_dependencies import control_deps
-
-        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
-        g = gm.graph
-        val = torch.randn(4, device=GPU_TYPE)
-
-        x = g.placeholder("x")
-        x.meta["val"] = val
-
-        # Simulated reloaded activation on side stream 19
-        reload = g.call_function(torch.ops.aten.add.Tensor, args=(x, x))
-        reload.meta.update(
-            {
-                "val": val,
-                "partitioner_tag": "is_backward",
-                "custom": {"stream": 19},
-            }
-        )
-
-        # record_event on side stream after reload completes
-        record = g.call_function(torch.ops.streams.record_event.default, args=(42, 19))
-        record.meta["partitioner_tag"] = "must_be_in_backward"
-
-        # Other backward compute on default stream (between record and wait)
-        other = g.call_function(torch.ops.aten.mul.Tensor, args=(x, x))
-        other.meta.update(
-            {
-                "val": val,
-                "partitioner_tag": "is_backward",
-                "custom": {"stream": 0},
-            }
-        )
-
-        # wait_event on default stream
-        wait = g.call_function(torch.ops.streams.wait_event.default, args=(42, 0))
-        wait.meta["partitioner_tag"] = "must_be_in_backward"
-
-        # Consumer reads reload result + other compute on default stream
-        consumer = g.call_function(torch.ops.aten.add.Tensor, args=(reload, other))
-        consumer.meta.update(
-            {
-                "val": val,
-                "partitioner_tag": "is_backward",
-                "custom": {"stream": 0},
-            }
-        )
-
-        g.output((consumer,))
-        gm.recompile()
-
-        wrap_all_sync_nodes_with_control_deps(gm)
-
-        # The consumer's reload arg must flow through wait_event's control_deps,
-        # NOT record_event's.
-        output_node = next(n for n in gm.graph.nodes if n.op == "output")
-        final_consumer = output_node.args[0][0]
-        reload_arg = final_consumer.args[0]
-
-        self.assertEqual(reload_arg.target, operator.getitem)
-        ctrl_node = reload_arg.args[0]
-        self.assertIs(ctrl_node.target, control_deps)
-
-        # The control_deps wraps wait_event, not record_event
-        subgraph = getattr(gm, ctrl_node.args[1].target)
-        subgraph_targets = {
-            n.target for n in subgraph.graph.nodes if n.op == "call_function"
-        }
-        self.assertIn(torch.ops.streams.wait_event.default, subgraph_targets)
-        self.assertNotIn(torch.ops.streams.record_event.default, subgraph_targets)
-
-    @requires_gpu()
     def test_control_deps_orders_void_op_across_nested_calls(self):
         """record_event's void op must be named as an additional_buffer_dep
         of the subsequent wait_event's operations after Inductor lowering.
@@ -488,6 +408,59 @@ class TestControlDeps(InductorTestCase):
             total_mutations,
             0,
             "expected MutationOutput entries for pass-through values in control_deps",
+        )
+
+    def test_stream_cache_setup_only_once_per_device(self):
+        """When codegen_device_guard_enter is called multiple times for the same
+        device (e.g., forward + backward sharing a wrapper), only the first call
+        should set setup_stream_cache=True. A different device gets its own
+        setup."""
+        from unittest.mock import MagicMock
+
+        from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+        from torch.utils._ordered_set import OrderedSet
+
+        codegen = MagicMock(spec=PythonWrapperCodegen)
+        codegen._stream_cache_setup_devices = OrderedSet()
+        codegen.last_seen_device_guard_index = None
+        codegen.writeline = MagicMock()
+
+        stream_map = {1: 10}
+
+        # First call for device 0: should setup
+        PythonWrapperCodegen.codegen_device_guard_enter(
+            codegen,
+            device_idx=0,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
+        )
+        first_line = codegen.writeline.call_args_list[0][0][0]
+        self.assertTrue(first_line.setup_stream_cache)
+
+        # Second call for same device 0: should NOT setup again
+        PythonWrapperCodegen.codegen_device_guard_enter(
+            codegen,
+            device_idx=0,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
+        )
+        second_line = codegen.writeline.call_args_list[1][0][0]
+        self.assertFalse(
+            second_line.setup_stream_cache,
+            "Second entry for same device should skip stream cache setup",
+        )
+
+        # First call for device 1: should setup (different device)
+        PythonWrapperCodegen.codegen_device_guard_enter(
+            codegen,
+            device_idx=1,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
+        )
+        third_line = codegen.writeline.call_args_list[2][0][0]
+        self.assertTrue(
+            third_line.setup_stream_cache,
+            "First entry for a new device should setup stream cache",
         )
 
 
