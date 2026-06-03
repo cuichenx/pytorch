@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 
+import re
 import unittest
 
 import torch
@@ -264,6 +265,92 @@ class TestControlDeps(InductorTestCase):
             torch.testing.assert_close(result, expected)
 
     @requires_gpu()
+    def test_wait_event_threads_record_event_passthroughs(self):
+        """wait_event must thread record_event's passthroughs to consumers.
+
+        Regression test for the backward reload pattern:
+          reload [side stream] → record_event → ... → wait_event [default] → consumer
+
+        Without threading, the consumer depends only on record_event's getitem
+        (wrong stream), so the inductor scheduler can place the consumer kernel
+        before wait_event fires.
+        """
+        import operator
+
+        from torch._functorch._aot_autograd.streams import (
+            wrap_all_sync_nodes_with_control_deps,
+        )
+        from torch._inductor.fx_passes.control_dependencies import control_deps
+
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        g = gm.graph
+        val = torch.randn(4, device=GPU_TYPE)
+
+        x = g.placeholder("x")
+        x.meta["val"] = val
+
+        # Simulated reloaded activation on side stream 19
+        reload = g.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+        reload.meta.update(
+            {
+                "val": val,
+                "partitioner_tag": "is_backward",
+                "custom": {"stream": 19},
+            }
+        )
+
+        # record_event on side stream after reload completes
+        record = g.call_function(torch.ops.streams.record_event.default, args=(42, 19))
+        record.meta["partitioner_tag"] = "must_be_in_backward"
+
+        # Other backward compute on default stream (between record and wait)
+        other = g.call_function(torch.ops.aten.mul.Tensor, args=(x, x))
+        other.meta.update(
+            {
+                "val": val,
+                "partitioner_tag": "is_backward",
+                "custom": {"stream": 0},
+            }
+        )
+
+        # wait_event on default stream
+        wait = g.call_function(torch.ops.streams.wait_event.default, args=(42, 0))
+        wait.meta["partitioner_tag"] = "must_be_in_backward"
+
+        # Consumer reads reload result + other compute on default stream
+        consumer = g.call_function(torch.ops.aten.add.Tensor, args=(reload, other))
+        consumer.meta.update(
+            {
+                "val": val,
+                "partitioner_tag": "is_backward",
+                "custom": {"stream": 0},
+            }
+        )
+
+        g.output((consumer,))
+        gm.recompile()
+
+        wrap_all_sync_nodes_with_control_deps(gm)
+
+        # The consumer's reload arg must flow through wait_event's control_deps,
+        # NOT record_event's.
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+        final_consumer = output_node.args[0][0]
+        reload_arg = final_consumer.args[0]
+
+        self.assertEqual(reload_arg.target, operator.getitem)
+        ctrl_node = reload_arg.args[0]
+        self.assertIs(ctrl_node.target, control_deps)
+
+        # The control_deps wraps wait_event, not record_event
+        subgraph = getattr(gm, ctrl_node.args[1].target)
+        subgraph_targets = {
+            n.target for n in subgraph.graph.nodes if n.op == "call_function"
+        }
+        self.assertIn(torch.ops.streams.wait_event.default, subgraph_targets)
+        self.assertNotIn(torch.ops.streams.record_event.default, subgraph_targets)
+
+    @requires_gpu()
     def test_control_deps_orders_void_op_across_nested_calls(self):
         """record_event's void op must be named as an additional_buffer_dep
         of the subsequent wait_event's operations after Inductor lowering.
@@ -462,6 +549,75 @@ class TestControlDeps(InductorTestCase):
             third_line.setup_stream_cache,
             "First entry for a new device should setup stream cache",
         )
+
+    @requires_cuda_triton
+    def test_stream_event_cache_functions(self):
+        """_setup_stream_event_cache populates thread-local caches that
+        _get_stream_by_index and _get_event_by_index read from."""
+        from torch._dynamo.variables.streams import (
+            _get_event_by_index,
+            _get_stream_by_index,
+            _setup_stream_event_cache,
+            _tls,
+        )
+
+        try:
+            _setup_stream_event_cache(
+                default_stream_indices=[0],
+                new_stream_indices=[1],
+                event_indices=[5],
+            )
+
+            s0 = _get_stream_by_index(0)
+            self.assertEqual(s0, torch.cuda.current_stream())
+
+            s1 = _get_stream_by_index(1)
+            self.assertIsInstance(s1, torch.cuda.Stream)
+            self.assertNotEqual(s1, torch.cuda.current_stream())
+
+            e5 = _get_event_by_index(5)
+            self.assertIsInstance(e5, torch.Event)
+
+            # Same index returns same cached object
+            self.assertIs(_get_stream_by_index(0), s0)
+            self.assertIs(_get_stream_by_index(1), s1)
+            self.assertIs(_get_event_by_index(5), e5)
+        finally:
+            if hasattr(_tls, "stream_cache"):
+                del _tls.stream_cache
+            if hasattr(_tls, "event_cache"):
+                del _tls.event_cache
+
+    @requires_gpu()
+    def test_generated_code_calls_setup_stream_event_cache(self):
+        """Generated inductor code should call _setup_stream_event_cache
+        with non-empty stream and event index lists when the graph has
+        stream/event operations."""
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            e = torch.Event()
+            with s:
+                y = x + 1
+                e.record()
+            e.wait()
+            return y * 2
+
+        x = torch.ones(4, 4, device=GPU_TYPE)
+        result, code = run_and_get_code(torch.compile(fn), x)
+
+        match = re.search(
+            r"_setup_stream_event_cache\((\[.*?\]), (\[.*?\]), (\[.*?\])",
+            code[0],
+        )
+        self.assertIsNotNone(match, "_setup_stream_event_cache call not found")
+        new_indices = eval(match.group(2))
+        event_indices = eval(match.group(3))
+        self.assertGreater(len(new_indices), 0, "Expected non-empty new stream indices")
+        self.assertGreater(len(event_indices), 0, "Expected non-empty event indices")
+
+        expected = fn(torch.ones(4, 4, device=GPU_TYPE))
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":
