@@ -60,7 +60,7 @@ from .descriptors import (
     SyntheticBaseAOTInput,
     ViewBaseAOTInput,
 )
-from .functional_utils import gen_alias_from_base
+from .functional_utils import gen_alias_from_base, resolve_input_view_bits
 from .graph_capture_wrappers import aot_dispatch_subclass
 from .input_output_analysis import (
     compute_overlapping_inputs,
@@ -220,6 +220,8 @@ class AliasOfInputHandler:
         self.unwrap_out = _unwrap_tensoralias if trace_joint else _identity
         self.requires_grad = info.requires_grad
         self.view_meta_sequence = info.view_meta_sequence
+        self.is_conj = info.is_conj
+        self.is_neg = info.is_neg
         self.replay_views = config.view_replay_for_aliased_outputs
 
     def __call__(
@@ -232,6 +234,8 @@ class AliasOfInputHandler:
             self.requires_grad,
             self.view_meta_sequence,
             replay_views=self.replay_views,
+            target_is_conj=self.is_conj,
+            target_is_neg=self.is_neg,
         )
 
 
@@ -268,6 +272,8 @@ class AliasOfIntermediateHandler:
         self.unwrap_out = _unwrap_tensoralias if trace_joint else _identity
         self.requires_grad = info.requires_grad
         self.view_meta_sequence = info.view_meta_sequence
+        self.is_conj = info.is_conj
+        self.is_neg = info.is_neg
         self.replay_views = config.view_replay_for_aliased_outputs
 
     def __call__(
@@ -280,6 +286,8 @@ class AliasOfIntermediateHandler:
             self.requires_grad,
             self.view_meta_sequence,
             replay_views=self.replay_views,
+            target_is_conj=self.is_conj,
+            target_is_neg=self.is_neg,
         )
 
 
@@ -510,6 +518,10 @@ class _RuntimeCompiledFnInvoker:
     # code from _create_runtime_wrapper(). Keep both in sync.
     # See Note [RuntimeWrapper codegen specification methods]
     def run(self, args: list[Any], *, on_before_call: Callable[[], None]) -> list[Any]:
+        args = [
+            resolve_input_view_bits(arg) if isinstance(arg, torch.Tensor) else arg
+            for arg in args
+        ]
         with self.first_invocation_ctx():
             if self.trace_joint:
                 args_ = list(args)
@@ -799,6 +811,11 @@ def _codegen_compiled_fn_invocation(
     indices_of_inps_to_detach: list[int],
     disable_amp: bool,
 ) -> None:
+    rw_globals["_resolve_input_view_bits_"] = resolve_input_view_bits
+    rw_lines.append(
+        "    args = [_resolve_input_view_bits_(arg) "
+        "if isinstance(arg, torch.Tensor) else arg for arg in args]"
+    )
     rw_lines.append("    with _first_ctx_():")
     # trace_joint is known at codegen time. Only the joint/training path needs
     # forced view replay; inference wrappers should not touch this TLS state.
@@ -946,7 +963,9 @@ def _create_runtime_wrapper(
                     f"    ret_outs.append(gen_alias_from_base("
                     f"orig_inputs[{handler.base_idx}], {out_expr}, "
                     f"{handler.requires_grad!r}, {vms_name}, "
-                    f"replay_views={handler.replay_views!r}))"
+                    f"replay_views={handler.replay_views!r}, "
+                    f"target_is_conj={handler.is_conj!r}, "
+                    f"target_is_neg={handler.is_neg!r}))"
                 )
             elif isinstance(handler, AliasOfIntermediateHandler):
                 vms_name = f"_vms_{i}"
@@ -966,7 +985,9 @@ def _create_runtime_wrapper(
                     f"    ret_outs.append(gen_alias_from_base("
                     f"{base_expr}, {out_expr}, "
                     f"{handler.requires_grad!r}, {vms_name}, "
-                    f"replay_views={handler.replay_views!r}))"
+                    f"replay_views={handler.replay_views!r}, "
+                    f"target_is_conj={handler.is_conj!r}, "
+                    f"target_is_neg={handler.is_neg!r}))"
                 )
             else:
                 raise AssertionError(
@@ -2821,7 +2842,10 @@ class _AutogradBackwardCompiler:
         self._prepare_lazy_backward_context(saved_tensors_use_once)
 
         bw_module = self.lazy_backward_info.bw_module
-        placeholder_list = self.lazy_backward_info.placeholder_list
+        placeholder_list = [
+            resolve_input_view_bits(arg) if isinstance(arg, torch.Tensor) else arg
+            for arg in self.lazy_backward_info.placeholder_list
+        ]
         saved_context = self.lazy_backward_info.saved_context
         saved_compile_context = self.lazy_backward_info.saved_compile_context
 
@@ -3537,7 +3561,12 @@ class _AOTDispatchAutogradFunctionFactory:
 
                 return call_func_at_runtime_with_args(
                     compiled_bw,
-                    all_args,
+                    [
+                        resolve_input_view_bits(arg)
+                        if isinstance(arg, torch.Tensor)
+                        else arg
+                        for arg in all_args
+                    ],
                     steal_args=True,
                     disable_amp=disable_amp,
                 )
